@@ -6,7 +6,7 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import PlaybackState, PlayerFeature, PlayerType
-from music_assistant_models.player import DeviceInfo, PlayerMedia
+from music_assistant_models.player import DeviceInfo, PlayerMedia, PlayerSource
 
 from music_assistant.models.player import Player
 
@@ -53,11 +53,27 @@ class SpotifyConnectPlayer(Player):
         volume: int = device_info.get("volume_percent", 50)
         self._attr_volume_level = volume
         self._attr_playback_state = PlaybackState.IDLE
+        # Set Spotify as the active source so skip/seek controls are available
+        self._attr_active_source = "spotify"
 
     @property
     def maspotconn_provider(self) -> MaspotconnProvider:
         """Return the provider as MaspotconnProvider."""
         return cast("MaspotconnProvider", self.provider)
+
+    @property
+    def _source_list(self) -> list[PlayerSource]:
+        """Return list of available sources for this player."""
+        return [
+            PlayerSource(
+                id="spotify",
+                name="Spotify",
+                passive=True,
+                can_play_pause=True,
+                can_next_previous=True,
+                can_seek=True,
+            ),
+        ]
 
     @property
     def needs_poll(self) -> bool:
@@ -134,8 +150,12 @@ class SpotifyConnectPlayer(Player):
             return
 
         try:
-            self.logger.debug("Skipping to next track")
-            await self.maspotconn_provider._spotify_provider._post_data("me/player/next")
+            self.logger.debug("Skipping to next track on device %s", self._device_id)
+            await self.maspotconn_provider._spotify_provider._post_data(
+                "me/player/next", device_id=self._device_id
+            )
+            # Poll immediately to update state
+            await self.poll()
         except Exception as err:
             self.logger.error("Failed to skip to next track: %s", err)
 
@@ -146,8 +166,12 @@ class SpotifyConnectPlayer(Player):
             return
 
         try:
-            self.logger.debug("Going to previous track")
-            await self.maspotconn_provider._spotify_provider._post_data("me/player/previous")
+            self.logger.debug("Going to previous track on device %s", self._device_id)
+            await self.maspotconn_provider._spotify_provider._post_data(
+                "me/player/previous", device_id=self._device_id
+            )
+            # Poll immediately to update state
+            await self.poll()
         except Exception as err:
             self.logger.error("Failed to go to previous track: %s", err)
 
