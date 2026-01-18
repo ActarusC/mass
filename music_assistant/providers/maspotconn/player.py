@@ -36,11 +36,13 @@ class SpotifyConnectPlayer(Player):
         self._attr_name = device_info["name"]
         self._attr_type = PlayerType.PLAYER
         self._attr_supported_features = {
+            PlayerFeature.POWER,
             PlayerFeature.PAUSE,
             PlayerFeature.VOLUME_SET,
             PlayerFeature.NEXT_PREVIOUS,
             PlayerFeature.SEEK,
         }
+        self._attr_powered = True
 
         # Set device info
         device_type: str = device_info.get("type", "Speaker")
@@ -53,8 +55,8 @@ class SpotifyConnectPlayer(Player):
         volume: int = device_info.get("volume_percent", 50)
         self._attr_volume_level = volume
         self._attr_playback_state = PlaybackState.IDLE
-        # Set Spotify as the active source so skip/seek controls are available
-        self._attr_active_source = "spotify"
+        # Don't set active_source at startup - let MA send play_media commands
+        # active_source will be set to "spotify" when playing external content
 
     @property
     def maspotconn_provider(self) -> MaspotconnProvider:
@@ -198,12 +200,14 @@ class SpotifyConnectPlayer(Player):
 
         try:
             self.logger.info(
-                "play_media called: uri=%s, title=%s, artist=%s, album=%s, source_id=%s",
+                "play_media called: uri=%s, title=%s, artist=%s, album=%s, "
+                "source_id=%s, queue_item_id=%s",
                 media.uri,
                 media.title,
                 media.artist,
                 media.album,
                 media.source_id,
+                media.queue_item_id,
             )
 
             spotify_uri = None
@@ -211,6 +215,12 @@ class SpotifyConnectPlayer(Player):
             # If we have a Spotify URI directly, use it
             if media.uri and media.uri.startswith("spotify:"):
                 spotify_uri = media.uri
+
+            # If this is from a Music Assistant queue, try to get the Spotify URI
+            if not spotify_uri and media.source_id and media.queue_item_id:
+                spotify_uri = await self._get_spotify_uri_from_queue(
+                    media.source_id, media.queue_item_id
+                )
 
             if not spotify_uri:
                 self.logger.warning(
@@ -259,6 +269,28 @@ class SpotifyConnectPlayer(Player):
         except Exception as err:
             self.logger.error("Failed to play media: %s", err)
 
+    async def _get_spotify_uri_from_queue(self, queue_id: str, queue_item_id: str) -> str | None:
+        """Extract Spotify URI from a Music Assistant queue item."""
+        try:
+            # Access the queue items from the player_queues controller
+            queue_items = self.mass.player_queues._queue_items.get(queue_id, [])
+            for queue_item in queue_items:
+                if queue_item.queue_item_id == queue_item_id:
+                    # Found the queue item, now get the Spotify URI from provider mappings
+                    if queue_item.media_item:
+                        for mapping in getattr(queue_item.media_item, "provider_mappings", []):
+                            if mapping.provider_domain == "spotify":
+                                spotify_uri = f"spotify:track:{mapping.item_id}"
+                                self.logger.debug(
+                                    "Found Spotify URI from queue item: %s", spotify_uri
+                                )
+                                return spotify_uri
+                    break
+            self.logger.debug("Could not find Spotify URI for queue_item_id=%s", queue_item_id)
+        except Exception as err:
+            self.logger.debug("Error getting Spotify URI from queue: %s", err)
+        return None
+
     async def poll(self) -> None:
         """Poll player for state updates."""
         if not self.maspotconn_provider._spotify_provider:
@@ -297,9 +329,8 @@ class SpotifyConnectPlayer(Player):
                 PlaybackState.PLAYING if is_playing else PlaybackState.PAUSED
             )
 
-            # Set active source to "spotify" to prevent queue lookup
-            # This ensures __calculate_current_media() uses self._current_media instead of queue
-            self._attr_active_source = "spotify"
+            # Don't set active_source - this allows MA to send play_media commands
+            # The source_list with "spotify" source handles skip/seek controls
 
             # Update volume
             volume = device.get("volume_percent")
