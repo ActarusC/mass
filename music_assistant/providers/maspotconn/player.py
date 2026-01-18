@@ -330,8 +330,19 @@ class SpotifyConnectPlayer(Player):
                             # Get the Spotify URI for the context
                             for mapping in getattr(original_item, "provider_mappings", []):
                                 if mapping.provider_domain == "spotify":
-                                    context_uri = f"spotify:{media_type}:{mapping.item_id}"
-                                    self.logger.debug("Found Spotify context URI: %s", context_uri)
+                                    item_id = mapping.item_id
+                                    # Validate that this is a real Spotify ID
+                                    # Spotify IDs are 22 alphanumeric characters
+                                    # Skip internal MA IDs like "liked_songs-spotify--xxx"
+                                    if item_id and len(item_id) == 22 and item_id.isalnum():
+                                        context_uri = f"spotify:{media_type}:{item_id}"
+                                        self.logger.debug(
+                                            "Found Spotify context URI: %s", context_uri
+                                        )
+                                    else:
+                                        self.logger.debug(
+                                            "Skipping invalid Spotify ID: %s", item_id
+                                        )
                                     break
 
             if not track_uri:
