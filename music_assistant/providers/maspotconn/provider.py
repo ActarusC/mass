@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+import asyncio
+from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import EventType
 
@@ -18,6 +19,9 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.providers.spotify.provider import SpotifyProvider
 
+# How often to poll for new devices (in seconds)
+DEVICE_DISCOVERY_INTERVAL = 60
+
 
 class MaspotconnProvider(PlayerProvider):
     """Player provider for Spotify Connect devices via Web API."""
@@ -31,6 +35,9 @@ class MaspotconnProvider(PlayerProvider):
         """Initialize the provider."""
         super().__init__(mass, manifest, config)
         self._spotify_provider: SpotifyProvider | None = None
+        # Cache of known devices (device_id -> device_info)
+        self._device_cache: dict[str, dict[str, Any]] = {}
+        self._discovery_task: asyncio.Task[None] | None = None
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -56,6 +63,9 @@ class MaspotconnProvider(PlayerProvider):
             self.logger.info("Spotify provider found, triggering device discovery")
             await self.discover_players()
 
+        # Start periodic device discovery
+        self._discovery_task = asyncio.create_task(self._periodic_discovery())
+
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
         self.logger.info("Maspotconn provider loaded")
@@ -69,6 +79,10 @@ class MaspotconnProvider(PlayerProvider):
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
         self.logger.info("Unloading Maspotconn provider")
+        # Stop periodic discovery
+        if self._discovery_task:
+            self._discovery_task.cancel()
+            self._discovery_task = None
         for player in self.players:
             await self.mass.players.unregister(player.player_id)
 
@@ -85,15 +99,18 @@ class MaspotconnProvider(PlayerProvider):
             devices_data = await self._spotify_provider._get_data("me/player/devices")
             devices = devices_data.get("devices", [])
 
-            self.logger.info("✅ Found %d Spotify device(s)", len(devices))
+            self.logger.info("✅ Found %d active Spotify device(s)", len(devices))
 
+            # Update cache with newly discovered devices
             for device in devices:
                 device_id = device.get("id")
+                if device_id:
+                    self._device_cache[device_id] = device
+
+            # Register players for all cached devices (including inactive ones)
+            for device_id, device in self._device_cache.items():
                 device_name = device.get("name")
                 device_type = device.get("type")
-
-                if not device_id:
-                    continue
 
                 self.logger.debug(
                     "Found device: %s (type: %s, id: %s)",
@@ -120,6 +137,20 @@ class MaspotconnProvider(PlayerProvider):
 
         except Exception as err:
             self.logger.exception("Failed to discover Spotify devices: %s", err)
+
+    async def _periodic_discovery(self) -> None:
+        """Periodically discover new Spotify Connect devices."""
+        while True:
+            try:
+                await asyncio.sleep(DEVICE_DISCOVERY_INTERVAL)
+                if self._spotify_provider:
+                    self.logger.debug("Running periodic device discovery...")
+                    await self.discover_players()
+            except asyncio.CancelledError:
+                self.logger.debug("Periodic discovery task cancelled")
+                break
+            except Exception as err:
+                self.logger.warning("Error in periodic discovery: %s", err)
 
     async def _find_spotify_provider(self) -> None:
         """Find and link to the Spotify music provider."""
