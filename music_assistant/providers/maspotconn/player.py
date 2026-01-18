@@ -197,21 +197,36 @@ class SpotifyConnectPlayer(Player):
             return
 
         try:
-            self.logger.info("Playing media: %s on device %s", media.uri, self._device_id)
+            self.logger.info(
+                "play_media called: uri=%s, title=%s, artist=%s, album=%s, source_id=%s",
+                media.uri,
+                media.title,
+                media.artist,
+                media.album,
+                media.source_id,
+            )
 
-            if not media.uri or not media.uri.startswith("spotify:"):
-                self.logger.warning("Media URI is not a Spotify URI: %s", media.uri)
+            spotify_uri = None
+
+            # If we have a Spotify URI directly, use it
+            if media.uri and media.uri.startswith("spotify:"):
+                spotify_uri = media.uri
+
+            if not spotify_uri:
+                self.logger.warning(
+                    "No Spotify URI found for media: %s (uri=%s)", media.title, media.uri
+                )
                 return
 
             # Determine if this is a track URI or a context URI (playlist, album, artist)
-            is_track = media.uri.startswith("spotify:track:")
+            is_track = spotify_uri.startswith("spotify:track:")
             is_context = any(
-                media.uri.startswith(f"spotify:{prefix}:")
+                spotify_uri.startswith(f"spotify:{prefix}:")
                 for prefix in ["playlist", "album", "artist", "show"]
             )
 
             if not (is_track or is_context):
-                self.logger.warning("Unsupported Spotify URI type: %s", media.uri)
+                self.logger.warning("Unsupported Spotify URI type: %s", spotify_uri)
                 return
 
             # Transfer playback to this device first
@@ -224,13 +239,13 @@ class SpotifyConnectPlayer(Player):
                 # For individual tracks, use the uris parameter
                 await self.maspotconn_provider._spotify_provider._put_data(
                     "me/player/play",
-                    data={"device_id": self._device_id, "uris": [media.uri]},
+                    data={"device_id": self._device_id, "uris": [spotify_uri]},
                 )
             else:
                 # For context URIs (playlists, albums, etc.), use the context_uri parameter
                 await self.maspotconn_provider._spotify_provider._put_data(
                     "me/player/play",
-                    data={"device_id": self._device_id, "context_uri": media.uri},
+                    data={"device_id": self._device_id, "context_uri": spotify_uri},
                 )
 
             # Update state
