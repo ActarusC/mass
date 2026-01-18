@@ -211,6 +211,7 @@ class SpotifyConnectPlayer(Player):
             )
 
             spotify_uri = None
+            context_uri = None
 
             # If we have a Spotify URI directly, use it
             if media.uri and media.uri.startswith("spotify:"):
@@ -218,7 +219,7 @@ class SpotifyConnectPlayer(Player):
 
             # If this is from a Music Assistant queue, try to get the Spotify URI
             if not spotify_uri and media.source_id and media.queue_item_id:
-                spotify_uri = await self._get_spotify_uri_from_queue(
+                spotify_uri, context_uri = await self._get_spotify_uri_from_queue(
                     media.source_id, media.queue_item_id
                 )
 
@@ -228,35 +229,51 @@ class SpotifyConnectPlayer(Player):
                 )
                 return
 
-            # Determine if this is a track URI or a context URI (playlist, album, artist)
-            is_track = spotify_uri.startswith("spotify:track:")
-            is_context = any(
-                spotify_uri.startswith(f"spotify:{prefix}:")
-                for prefix in ["playlist", "album", "artist", "show"]
-            )
-
-            if not (is_track or is_context):
-                self.logger.warning("Unsupported Spotify URI type: %s", spotify_uri)
-                return
-
             # Transfer playback to this device first
             await self.maspotconn_provider._spotify_provider._put_data(
                 "me/player", data={"device_ids": [self._device_id], "play": True}
             )
 
-            # Play the media
-            if is_track:
-                # For individual tracks, use the uris parameter
+            # If we have a context URI (playlist/album), use it to play the full context
+            if context_uri:
+                self.logger.info(
+                    "Playing Spotify context: %s (starting at track %s)",
+                    context_uri,
+                    spotify_uri,
+                )
                 await self.maspotconn_provider._spotify_provider._put_data(
                     "me/player/play",
-                    data={"device_id": self._device_id, "uris": [spotify_uri]},
+                    data={
+                        "device_id": self._device_id,
+                        "context_uri": context_uri,
+                        "offset": {"uri": spotify_uri},
+                    },
                 )
             else:
-                # For context URIs (playlists, albums, etc.), use the context_uri parameter
-                await self.maspotconn_provider._spotify_provider._put_data(
-                    "me/player/play",
-                    data={"device_id": self._device_id, "context_uri": spotify_uri},
+                # Determine if this is a track URI or a context URI
+                is_track = spotify_uri.startswith("spotify:track:")
+                is_context = any(
+                    spotify_uri.startswith(f"spotify:{prefix}:")
+                    for prefix in ["playlist", "album", "artist", "show"]
                 )
+
+                if not (is_track or is_context):
+                    self.logger.warning("Unsupported Spotify URI type: %s", spotify_uri)
+                    return
+
+                # Play the media
+                if is_track:
+                    # For individual tracks, use the uris parameter
+                    await self.maspotconn_provider._spotify_provider._put_data(
+                        "me/player/play",
+                        data={"device_id": self._device_id, "uris": [spotify_uri]},
+                    )
+                else:
+                    # For context URIs (playlists, albums, etc.)
+                    await self.maspotconn_provider._spotify_provider._put_data(
+                        "me/player/play",
+                        data={"device_id": self._device_id, "context_uri": spotify_uri},
+                    )
 
             # Update state
             self._attr_current_media = media
@@ -269,27 +286,62 @@ class SpotifyConnectPlayer(Player):
         except Exception as err:
             self.logger.error("Failed to play media: %s", err)
 
-    async def _get_spotify_uri_from_queue(self, queue_id: str, queue_item_id: str) -> str | None:
-        """Extract Spotify URI from a Music Assistant queue item."""
+    async def _get_spotify_uri_from_queue(
+        self, queue_id: str, queue_item_id: str
+    ) -> tuple[str | None, str | None]:
+        """Extract Spotify URI and context URI from a Music Assistant queue item.
+
+        Returns:
+            tuple: (track_uri, context_uri) - context_uri is set if this is the first
+                   track of a playlist/album that should be played as a context.
+        """
         try:
             # Access the queue items from the player_queues controller
             queue_items = self.mass.player_queues._queue_items.get(queue_id, [])
-            for queue_item in queue_items:
+            queue = self.mass.player_queues._queues.get(queue_id)
+
+            track_uri = None
+            context_uri = None
+
+            # Find the queue item
+            item_index = None
+            for idx, queue_item in enumerate(queue_items):
                 if queue_item.queue_item_id == queue_item_id:
-                    # Found the queue item, now get the Spotify URI from provider mappings
+                    item_index = idx
+                    # Get the track URI from provider mappings
                     if queue_item.media_item:
                         for mapping in getattr(queue_item.media_item, "provider_mappings", []):
                             if mapping.provider_domain == "spotify":
-                                spotify_uri = f"spotify:track:{mapping.item_id}"
-                                self.logger.debug(
-                                    "Found Spotify URI from queue item: %s", spotify_uri
-                                )
-                                return spotify_uri
+                                track_uri = f"spotify:track:{mapping.item_id}"
+                                self.logger.debug("Found Spotify track URI: %s", track_uri)
+                                break
                     break
-            self.logger.debug("Could not find Spotify URI for queue_item_id=%s", queue_item_id)
+
+            # Check if this is the first item and we have a playlist/album context
+            if item_index == 0 and queue and hasattr(queue, "enqueued_media_items"):
+                enqueued = queue.enqueued_media_items
+                if enqueued:
+                    # Get the original media item that was enqueued
+                    original_item = enqueued[0] if enqueued else None
+                    if original_item:
+                        # Check if it's a playlist or album
+                        media_type = getattr(original_item, "media_type", None)
+                        if media_type and str(media_type) in ("playlist", "album"):
+                            # Get the Spotify URI for the context
+                            for mapping in getattr(original_item, "provider_mappings", []):
+                                if mapping.provider_domain == "spotify":
+                                    context_uri = f"spotify:{media_type}:{mapping.item_id}"
+                                    self.logger.debug("Found Spotify context URI: %s", context_uri)
+                                    break
+
+            if not track_uri:
+                self.logger.debug("Could not find Spotify URI for queue_item_id=%s", queue_item_id)
+
+            return track_uri, context_uri
+
         except Exception as err:
             self.logger.debug("Error getting Spotify URI from queue: %s", err)
-        return None
+        return None, None
 
     async def poll(self) -> None:
         """Poll player for state updates."""
