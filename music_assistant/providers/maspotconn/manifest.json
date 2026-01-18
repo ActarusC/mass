@@ -1,0 +1,11 @@
+{
+  "type": "player",
+  "domain": "maspotconn",
+  "stage": "alpha",
+  "name": "Spotify Connect Players",
+  "description": "Control Spotify Connect devices (like JBL Authentics 500) via Spotify Web API for lossless playback",
+  "codeowners": ["@ActarusC"],
+  "documentation": "https://github.com/ActarusC/maspotconn",
+  "multi_instance": false,
+  "requirements": []
+}
