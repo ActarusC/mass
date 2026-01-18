@@ -197,23 +197,49 @@ class SpotifyConnectPlayer(Player):
             return
 
         try:
-            self.logger.info("Playing media: %s", media.uri)
+            self.logger.info("Playing media: %s on device %s", media.uri, self._device_id)
 
-            # Transfer playback to this device
+            if not media.uri or not media.uri.startswith("spotify:"):
+                self.logger.warning("Media URI is not a Spotify URI: %s", media.uri)
+                return
+
+            # Determine if this is a track URI or a context URI (playlist, album, artist)
+            is_track = media.uri.startswith("spotify:track:")
+            is_context = any(
+                media.uri.startswith(f"spotify:{prefix}:")
+                for prefix in ["playlist", "album", "artist", "show"]
+            )
+
+            if not (is_track or is_context):
+                self.logger.warning("Unsupported Spotify URI type: %s", media.uri)
+                return
+
+            # Transfer playback to this device first
             await self.maspotconn_provider._spotify_provider._put_data(
                 "me/player", data={"device_ids": [self._device_id], "play": True}
             )
 
-            # If we have a Spotify URI, play it
-            if media.uri and media.uri.startswith("spotify:"):
+            # Play the media
+            if is_track:
+                # For individual tracks, use the uris parameter
                 await self.maspotconn_provider._spotify_provider._put_data(
-                    "me/player/play", data={"device_id": self._device_id, "uris": [media.uri]}
+                    "me/player/play",
+                    data={"device_id": self._device_id, "uris": [media.uri]},
+                )
+            else:
+                # For context URIs (playlists, albums, etc.), use the context_uri parameter
+                await self.maspotconn_provider._spotify_provider._put_data(
+                    "me/player/play",
+                    data={"device_id": self._device_id, "context_uri": media.uri},
                 )
 
             # Update state
             self._attr_current_media = media
             self._attr_playback_state = PlaybackState.PLAYING
             self.update_state(force_update=True)
+
+            # Poll immediately to sync state
+            await self.poll()
 
         except Exception as err:
             self.logger.error("Failed to play media: %s", err)
