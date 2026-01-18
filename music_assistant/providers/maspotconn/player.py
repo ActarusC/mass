@@ -269,7 +269,15 @@ class SpotifyConnectPlayer(Player):
             item = playback_data.get("item", {})
             if item:
                 artists = ", ".join(a["name"] for a in item.get("artists", []))
-                album = item.get("album", {}).get("name", "")
+                album_info = item.get("album", {})
+                album = album_info.get("name", "")
+
+                # Get album image URL (prefer largest image)
+                image_url = None
+                images = album_info.get("images", [])
+                if images:
+                    # Spotify returns images sorted by size, largest first
+                    image_url = images[0].get("url")
 
                 # Update current media directly (bypass queue/group logic)
                 media = PlayerMedia(
@@ -278,6 +286,7 @@ class SpotifyConnectPlayer(Player):
                     artist=artists,
                     album=album,
                     duration=item.get("duration_ms", 0) // 1000,
+                    image_url=image_url,
                 )
                 self._Player__attr_current_media = media
                 self._attr_current_media = media
