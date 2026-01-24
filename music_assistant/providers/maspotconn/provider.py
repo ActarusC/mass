@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import aiohttp
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import EventType
@@ -10,6 +13,7 @@ from music_assistant_models.enums import EventType
 from music_assistant.models.player_provider import PlayerProvider
 
 from .player import SpotifyConnectPlayer
+from .zeroconf_auth import authenticate_with_device
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -21,6 +25,17 @@ if TYPE_CHECKING:
 
 # How often to poll for new devices (in seconds)
 DEVICE_DISCOVERY_INTERVAL = 60
+
+# Known Spotify Connect devices (discovered via Zeroconf)
+# Format: device_id -> {ip, port, path, name}
+KNOWN_ZEROCONF_DEVICES = {
+    "5fa0918ceda03be082806b71a0d509caddd544f9": {
+        "ip": "10.0.0.119",
+        "port": 5389,
+        "path": "/zc",
+        "name": "JBL Authentics 500"
+    }
+}
 
 
 class MaspotconnProvider(PlayerProvider):
@@ -87,7 +102,7 @@ class MaspotconnProvider(PlayerProvider):
             await self.mass.players.unregister(player.player_id)
 
     async def discover_players(self) -> None:
-        """Discover Spotify Connect devices via Web API."""
+        """Enhanced device discovery with forced activation."""
         if not self._spotify_provider:
             self.logger.warning("Cannot discover devices - no Spotify provider available")
             return
@@ -106,6 +121,9 @@ class MaspotconnProvider(PlayerProvider):
                 device_id = device.get("id")
                 if device_id:
                     self._device_cache[device_id] = device
+
+            # Try to force activation of known JBL device
+            await self._force_jbl_activation()
 
             # Register players for all cached devices (including inactive ones)
             for device_id, device in self._device_cache.items():
@@ -137,6 +155,129 @@ class MaspotconnProvider(PlayerProvider):
 
         except Exception as err:
             self.logger.exception("Failed to discover Spotify devices: %s", err)
+
+    async def _force_jbl_activation(self) -> None:
+        """Forcer l'activation du JBL via Zeroconf avec authentification DH."""
+        if not self._spotify_provider:
+            self.logger.warning("Cannot activate JBL - no Spotify provider available")
+            return
+        
+        # Load librespot credentials
+        credentials = await self._load_librespot_credentials()
+        if not credentials:
+            self.logger.warning("No librespot credentials found")
+            return
+        
+        for device_id, zeroconf_info in KNOWN_ZEROCONF_DEVICES.items():
+            if device_id in self._device_cache:
+                self.logger.debug("Device %s already in cache", zeroconf_info["name"])
+                continue
+            
+            self.logger.info("🔄 Attempting to activate %s via Zeroconf DH auth...", zeroconf_info["name"])
+            
+            try:
+                # Step 1: Get device info from Zeroconf API
+                async with aiohttp.ClientSession() as session:
+                    url = f"http://{zeroconf_info['ip']}:{zeroconf_info['port']}{zeroconf_info['path']}?action=getInfo"
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                        if response.status != 200:
+                            self.logger.warning("Failed to get device info: %s", response.status)
+                            continue
+                        device_info = await response.json()
+                
+                self.logger.info("📡 Found device: %s %s", 
+                    device_info.get("brandDisplayName"), 
+                    device_info.get("modelDisplayName"))
+                
+                # Step 2: Authenticate with device using Zeroconf DH
+                device_url = f"http://{zeroconf_info['ip']}:{zeroconf_info['port']}{zeroconf_info['path']}"
+                
+                async with aiohttp.ClientSession() as session:
+                    success = await authenticate_with_device(
+                        session, device_url, credentials, device_info, self.logger
+                    )
+                
+                if success:
+                    self.logger.info("✅ Successfully activated %s via Zeroconf!", zeroconf_info["name"])
+                    
+                    # Wait a bit and check if device appears in Spotify API
+                    await asyncio.sleep(2)
+                    devices_data = await self._spotify_provider._get_data("me/player/devices")
+                    devices = devices_data.get("devices", [])
+                    
+                    for device in devices:
+                        if device.get("id") == device_id:
+                            self._device_cache[device_id] = device
+                            self.logger.info("✅ Device now visible in Spotify API!")
+                            break
+                    else:
+                        # Device activated but not yet in API, create entry
+                        self._device_cache[device_id] = {
+                            "id": device_id,
+                            "name": zeroconf_info["name"],
+                            "type": "Speaker",
+                            "is_active": True,
+                            "is_restricted": False,
+                            "volume_percent": 50
+                        }
+                else:
+                    self.logger.warning("Zeroconf auth failed for %s, creating minimal entry", zeroconf_info["name"])
+                    self._device_cache[device_id] = {
+                        "id": device_id,
+                        "name": zeroconf_info["name"],
+                        "type": "Speaker",
+                        "is_active": False,
+                        "is_restricted": False,
+                        "volume_percent": 50,
+                        "zeroconf_ip": zeroconf_info["ip"],
+                        "zeroconf_port": zeroconf_info["port"],
+                        "zeroconf_path": zeroconf_info["path"]
+                    }
+                
+            except asyncio.TimeoutError:
+                self.logger.warning("Timeout connecting to %s", zeroconf_info["name"])
+                self._device_cache[device_id] = {
+                    "id": device_id,
+                    "name": zeroconf_info["name"],
+                    "type": "Speaker",
+                    "is_active": False,
+                    "is_restricted": False,
+                    "volume_percent": 50,
+                    "zeroconf_ip": zeroconf_info["ip"],
+                    "zeroconf_port": zeroconf_info["port"],
+                    "zeroconf_path": zeroconf_info["path"]
+                }
+            except Exception as e:
+                self.logger.error("Failed to activate %s: %s", zeroconf_info["name"], e)
+                self._device_cache[device_id] = {
+                    "id": device_id,
+                    "name": zeroconf_info["name"],
+                    "type": "Speaker",
+                    "is_active": False,
+                    "is_restricted": False,
+                    "volume_percent": 50,
+                    "zeroconf_ip": zeroconf_info["ip"],
+                    "zeroconf_port": zeroconf_info["port"],
+                    "zeroconf_path": zeroconf_info["path"]
+                }
+
+    async def _load_librespot_credentials(self) -> dict[str, Any] | None:
+        """Load librespot credentials from cache."""
+        try:
+            # Find the spotify cache directory
+            cache_base = self.mass.cache_path
+            for item in os.listdir(cache_base):
+                if item.startswith("spotify-"):
+                    creds_file = os.path.join(cache_base, item, "credentials.json")
+                    if os.path.exists(creds_file):
+                        with open(creds_file, 'r') as f:
+                            return json.load(f)
+            
+            self.logger.warning("No librespot credentials file found in cache")
+            return None
+        except Exception as e:
+            self.logger.error("Failed to load librespot credentials: %s", e)
+            return None
 
     async def _periodic_discovery(self) -> None:
         """Periodically discover new Spotify Connect devices."""

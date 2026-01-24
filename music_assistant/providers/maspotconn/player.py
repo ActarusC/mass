@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -26,22 +27,20 @@ class SpotifyConnectPlayer(Player):
         device_info: dict[str, Any],
     ) -> None:
         """Initialize the Player."""
-        super().__init__(provider, player_id)
         self._provider = provider
-
-        # Store Spotify device ID
         self._device_id: str = device_info["id"]
+
+        # Enhanced attributes for reconnection (initialize BEFORE super().__init__)
+        self._attr_available = device_info.get("is_active", False)
+        self._attr_is_restricted = device_info.get("is_restricted", False)
+        self._last_seen = time.time()
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 3
+        self._reconnect_cooldown = 30  # seconds between reconnect attempts
 
         # Set player attributes
         self._attr_name = device_info["name"]
         self._attr_type = PlayerType.PLAYER
-        self._attr_supported_features = {
-            PlayerFeature.POWER,
-            PlayerFeature.PAUSE,
-            PlayerFeature.VOLUME_SET,
-            PlayerFeature.NEXT_PREVIOUS,
-            PlayerFeature.SEEK,
-        }
         self._attr_powered = True
 
         # Set device info
@@ -55,8 +54,18 @@ class SpotifyConnectPlayer(Player):
         volume: int = device_info.get("volume_percent", 50)
         self._attr_volume_level = volume
         self._attr_playback_state = PlaybackState.IDLE
-        # Don't set active_source at startup - let MA send play_media commands
-        # active_source will be set to "spotify" when playing external content
+
+        # Call parent constructor
+        super().__init__(provider, player_id)
+
+        # Set supported features AFTER super().__init__ (it resets them to empty set)
+        self._attr_supported_features = {
+            PlayerFeature.POWER,
+            PlayerFeature.PAUSE,
+            PlayerFeature.VOLUME_SET,
+            PlayerFeature.NEXT_PREVIOUS,
+            PlayerFeature.SEEK,
+        }
 
     @property
     def maspotconn_provider(self) -> MaspotconnProvider:
@@ -85,8 +94,81 @@ class SpotifyConnectPlayer(Player):
     @property
     def poll_interval(self) -> int:
         """Return the interval in seconds to poll the player for state updates."""
-        # Poll more frequently when playing
-        return 5 if self.playback_state == PlaybackState.PLAYING else 30
+        # Poll more frequently when playing or when trying to reconnect
+        if self.playback_state == PlaybackState.PLAYING:
+            return 5
+        elif not self.available and self._reconnect_attempts < self._max_reconnect_attempts:
+            return 10  # Poll more frequently when trying to reconnect
+        else:
+            return 30
+
+    @property
+    def available(self) -> bool:
+        """Return if the player is available.
+        
+        For Zeroconf-discovered devices, we mark them as available even if
+        not currently active in Spotify. The actual activation happens when
+        the user tries to play music.
+        """
+        if self._attr_is_restricted:
+            return False
+        
+        # Always available if discovered via Zeroconf (has zeroconf info)
+        device_info = self.maspotconn_provider._device_cache.get(self._device_id, {})
+        if device_info.get("zeroconf_ip"):
+            return True
+        
+        # Consider device available if seen recently (within last 5 minutes)
+        if time.time() - self._last_seen < 300:
+            return True
+        
+        return self._attr_available
+
+    async def force_reconnect(self) -> bool:
+        """Forcer la reconnexion du device."""
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            self.logger.warning("Max reconnect attempts reached for %s", self._device_id)
+            return False
+        
+        self._reconnect_attempts += 1
+        self.logger.info("Attempting to reconnect device %s (attempt %d/%d)", 
+                        self._device_id, self._reconnect_attempts, self._max_reconnect_attempts)
+        
+        try:
+            # Essayer de transférer la lecture vers ce device
+            # Cela peut "réveiller" le device et le rendre disponible
+            transfer_data = {
+                "device_ids": [self._device_id],
+                "play": False
+            }
+            
+            await self.maspotconn_provider._spotify_provider._put_data(
+                "me/player", data=transfer_data
+            )
+            
+            # Attendre un peu et vérifier si le device est maintenant actif
+            await asyncio.sleep(2)
+            
+            # Vérifier les devices disponibles
+            devices_data = await self.maspotconn_provider._spotify_provider._get_data("me/player/devices")
+            devices = devices_data.get("devices", [])
+            
+            for device in devices:
+                if device.get("id") == self._device_id:
+                    if device.get("is_active", False):
+                        self.logger.info("Successfully reconnected device %s", self._device_id)
+                        self._attr_available = True
+                        self._last_seen = time.time()
+                        self._reconnect_attempts = 0
+                        return True
+                    break
+            
+            self.logger.warning("Reconnect attempt %d failed for %s", self._reconnect_attempts, self._device_id)
+            return False
+            
+        except Exception as e:
+            self.logger.error("Error during reconnect attempt for %s: %s", self._device_id, e)
+            return False
 
     async def play(self) -> None:
         """Resume playback on this device."""
@@ -95,11 +177,18 @@ class SpotifyConnectPlayer(Player):
             return
 
         try:
+            # Enhanced reconnection logic
+            if not self.available:
+                if await self.force_reconnect():
+                    self.logger.info("Reconnected successfully, proceeding with play")
+                else:
+                    self.logger.warning("Cannot play - device unavailable")
+                    return
+
             self.logger.debug("Sending play command to device %s", self._device_id)
             await self.maspotconn_provider._spotify_provider._put_data(
                 "me/player/play", data={"device_id": self._device_id}
             )
-            # Optimistically update state
             self._attr_playback_state = PlaybackState.PLAYING
             self.update_state(force_update=True)
         except Exception as err:
@@ -355,12 +444,12 @@ class SpotifyConnectPlayer(Player):
         return None, None
 
     async def poll(self) -> None:
-        """Poll player for state updates."""
+        """Enhanced poll method - only updates state, no automatic reconnection."""
         if not self.maspotconn_provider._spotify_provider:
             return
 
         try:
-            # Get current playback state directly from Spotify API (no cache)
+            # Get current playback state directly from Spotify API
             auth_info = await self.maspotconn_provider._spotify_provider._get_auth_info()
             if not auth_info:
                 return
@@ -369,7 +458,17 @@ class SpotifyConnectPlayer(Player):
             playback_data = await self.maspotconn_provider._spotify_provider._get_data("me/player")
 
             if not playback_data:
-                # No active playback
+                # No active playback - check if our device exists in device list
+                devices_data = await self.maspotconn_provider._spotify_provider._get_data("me/player/devices")
+                devices = devices_data.get("devices", [])
+                
+                for device in devices:
+                    if device.get("id") == self._device_id:
+                        self._last_seen = time.time()
+                        self._attr_is_restricted = device.get("is_restricted", False)
+                        # Device exists, mark as idle but don't try to reconnect
+                        break
+                
                 self._attr_playback_state = PlaybackState.IDLE
                 self._attr_current_media = None
                 self._attr_active_source = None
@@ -379,21 +478,24 @@ class SpotifyConnectPlayer(Player):
             # Check if this device is the active one
             device = playback_data.get("device", {})
             if device.get("id") != self._device_id:
-                # Not playing on this device
+                # Not playing on this device - just update state, don't reconnect
                 self._attr_playback_state = PlaybackState.IDLE
                 self._attr_current_media = None
                 self._attr_active_source = None
                 self.update_state(force_update=True)
                 return
+            
+            # This device is active - update last seen and state
+            self._last_seen = time.time()
+            if self._reconnect_attempts > 0:
+                self.logger.info("Device %s is stable, reset reconnect attempts", self._device_id)
+                self._reconnect_attempts = 0
 
             # Update playback state
             is_playing = playback_data.get("is_playing", False)
             self._attr_playback_state = (
                 PlaybackState.PLAYING if is_playing else PlaybackState.PAUSED
             )
-
-            # Don't set active_source - this allows MA to send play_media commands
-            # The source_list with "spotify" source handles skip/seek controls
 
             # Update volume
             volume = device.get("volume_percent")
@@ -407,7 +509,7 @@ class SpotifyConnectPlayer(Player):
                 album_info = item.get("album", {})
                 album = album_info.get("name", "")
 
-                # Get album image URL (prefer largest image)
+                # Get album image URL
                 image_url = None
                 images = album_info.get("images", [])
                 if images:
@@ -433,7 +535,7 @@ class SpotifyConnectPlayer(Player):
                 )
             else:
                 # No item, clear current media
-                self._Player__attr_current_media = None  # type: ignore[assignment]
+                self._Player__attr_current_media = None
 
             # Update elapsed time
             progress_ms = playback_data.get("progress_ms", 0)

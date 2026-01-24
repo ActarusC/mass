@@ -1,6 +1,4 @@
-
 .DS_Store
-*.db
 *.pyc
 music_assistant/config.json
 *.cert
@@ -19,3 +17,9 @@ venv/
 .idea
 .coverage
 uv.lock
+.env
+
+# Runtime data
+cache/
+data/
+start.sh
