@@ -169,8 +169,14 @@ class MaspotconnProvider(PlayerProvider):
             return
         
         for device_id, zeroconf_info in KNOWN_ZEROCONF_DEVICES.items():
+            # Always ensure zeroconf info is in cache, even if device already discovered via API
             if device_id in self._device_cache:
-                self.logger.debug("Device %s already in cache", zeroconf_info["name"])
+                # Device exists, just add zeroconf info if missing
+                if "zeroconf_ip" not in self._device_cache[device_id]:
+                    self._device_cache[device_id]["zeroconf_ip"] = zeroconf_info["ip"]
+                    self._device_cache[device_id]["zeroconf_port"] = zeroconf_info["port"]
+                    self._device_cache[device_id]["zeroconf_path"] = zeroconf_info["path"]
+                    self.logger.debug("Added Zeroconf info to existing device %s", zeroconf_info["name"])
                 continue
             
             self.logger.info("🔄 Attempting to activate %s via Zeroconf DH auth...", zeroconf_info["name"])
