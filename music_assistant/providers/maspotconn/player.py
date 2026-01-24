@@ -243,7 +243,7 @@ class SpotifyConnectPlayer(Player):
         try:
             self.logger.debug("Skipping to next track on device %s", self._device_id)
             await self.maspotconn_provider._spotify_provider._post_data(
-                "me/player/next", device_id=self._device_id
+                f"me/player/next?device_id={self._device_id}", want_result=False
             )
             # Poll immediately to update state
             await self.poll()
@@ -259,7 +259,7 @@ class SpotifyConnectPlayer(Player):
         try:
             self.logger.debug("Going to previous track on device %s", self._device_id)
             await self.maspotconn_provider._spotify_provider._post_data(
-                "me/player/previous", device_id=self._device_id
+                f"me/player/previous?device_id={self._device_id}", want_result=False
             )
             # Poll immediately to update state
             await self.poll()
@@ -318,10 +318,17 @@ class SpotifyConnectPlayer(Player):
                 )
                 return
 
-            # Transfer playback to this device first
-            await self.maspotconn_provider._spotify_provider._put_data(
-                "me/player", data={"device_ids": [self._device_id], "play": True}
-            )
+            # Check if this device is already active - if so, skip the transfer
+            playback_data = await self.maspotconn_provider._spotify_provider._get_data("me/player")
+            current_device_id = playback_data.get("device", {}).get("id") if playback_data else None
+            
+            if current_device_id != self._device_id:
+                # Transfer playback to this device first
+                await self.maspotconn_provider._spotify_provider._put_data(
+                    "me/player", data={"device_ids": [self._device_id], "play": False}
+                )
+                # Small delay to let transfer complete
+                await asyncio.sleep(0.3)
 
             # If we have a context URI (playlist/album), use it to play the full context
             if context_uri:
@@ -490,6 +497,10 @@ class SpotifyConnectPlayer(Player):
             if self._reconnect_attempts > 0:
                 self.logger.info("Device %s is stable, reset reconnect attempts", self._device_id)
                 self._reconnect_attempts = 0
+
+            # Set active_source to "spotify" so native seek/skip is used
+            # instead of MA queue management (which restarts the song)
+            self._attr_active_source = "spotify"
 
             # Update playback state
             is_playing = playback_data.get("is_playing", False)
